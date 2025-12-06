@@ -2,7 +2,7 @@ import glob
 import logging
 from collections import deque
 from pathlib import Path
-from typing import Deque, List, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -165,8 +165,10 @@ class TradingEnv:
         self,
         windows: np.ndarray,
         close_series: np.ndarray,
-        transaction_cost: float = 0.0005,
-        reward_clip: float = 0.02,
+        transaction_cost: float = 0.0002,
+        reward_clip: Optional[float] = None,
+        hold_bonus: float = 1e-4,
+        position_penalty: float = 5e-5,
     ) -> None:
         """
         Args:
@@ -174,6 +176,8 @@ class TradingEnv:
             close_series: (steps + 1,) raw closes aligned with windows
             transaction_cost: flat cost applied when switching position
             reward_clip: clip reward to +/- this value (set None to disable)
+            hold_bonus: small bonus when staying flat
+            position_penalty: small per-step penalty when holding a position
         """
         if len(close_series) != len(windows) + 1:
             raise ValueError("close_series must be one element longer than windows")
@@ -184,15 +188,19 @@ class TradingEnv:
         self.action_size = 3  # 0: hold, 1: long, 2: short
         self.transaction_cost = transaction_cost
         self.reward_clip = reward_clip
+        self.hold_bonus = hold_bonus
+        self.position_penalty = position_penalty
         self.max_idx = len(windows) - 1
         self.reset()
         logger.info(
-            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s",
+            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s, hold_bonus=%s, position_penalty=%s",
             len(windows),
             self.window_size,
             self.base_feature_size,
             transaction_cost,
             reward_clip,
+            hold_bonus,
+            position_penalty,
         )
 
     def reset(self, seed: int = None) -> np.ndarray:
@@ -221,6 +229,10 @@ class TradingEnv:
         price_change_pct = (price_next - price_now) / price_now
 
         reward = self.position * price_change_pct
+        if action == 0 and self.position == 0:
+            reward += self.hold_bonus
+        if self.position != 0:
+            reward -= self.position_penalty
         if self.position != prev_position:
             reward -= self.transaction_cost
         if self.reward_clip is not None:
@@ -288,12 +300,12 @@ def train_dqn(
     model: Model,
     target_model: Model,
     episodes: int = 5,
-    batch_size: int = 32,
+    batch_size: int = 64,
     gamma: float = 0.99,
     epsilon: float = 1.0,
-    epsilon_min: float = 0.05,
-    epsilon_decay_steps: int = 20000,
-    warmup: int = 500,
+    epsilon_min: float = 0.1,
+    epsilon_decay_steps: int = 10000,
+    warmup: int = 2000,
     target_update: int = 250,
     log_every: int = 500,
     max_steps_per_episode: int = 20000,
@@ -422,7 +434,14 @@ if __name__ == "__main__":
 
     # Include position as an extra feature channel
     feature_size = windows.shape[2] + 1
-    env = TradingEnv(windows, close_series, transaction_cost=0.0005)
+    env = TradingEnv(
+        windows,
+        close_series,
+        transaction_cost=0.0002,
+        reward_clip=None,
+        hold_bonus=1e-4,
+        position_penalty=5e-5,
+    )
 
     q_model = create_q_model(window_size, feature_size, env.action_size)
     target_q_model = create_q_model(window_size, feature_size, env.action_size)
@@ -439,8 +458,8 @@ if __name__ == "__main__":
         q_model,
         target_q_model,
         episodes=3,
-        batch_size=32,
-        warmup=200,
+        batch_size=64,
+        warmup=2000,
         log_every=500,
     )
     plot_rewards(rewards)
