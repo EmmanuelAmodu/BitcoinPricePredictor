@@ -14,9 +14,61 @@ from tensorflow.keras.layers import (BatchNormalization, Concatenate, Conv1D,
                                      Lambda)
 from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import mixed_precision
 
 
 logger = logging.getLogger(__name__)
+
+
+def setup_gpu():
+    """Configure TensorFlow for optimal GPU/Metal performance."""
+    logger.info("Setting up GPU/accelerator configuration...")
+    
+    # List available devices
+    gpus = tf.config.list_physical_devices('GPU')
+    logger.info(f"TensorFlow version: {tf.__version__}")
+    logger.info(f"Available GPUs: {gpus}")
+    
+    has_gpu = len(gpus) > 0
+
+    if gpus:
+        try:
+            # Enable memory growth to avoid allocating all GPU memory at once
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logger.info(f"Enabled memory growth for {len(gpus)} GPU(s)")
+        except RuntimeError as e:
+            logger.warning(f"GPU memory growth setup failed: {e}")
+    else:
+        # Check for Metal (Apple Silicon)
+        logger.info("No CUDA GPUs found. Checking for Metal acceleration...")
+        all_devices = tf.config.list_physical_devices()
+        logger.info(f"All available devices: {all_devices}")
+        # Note: tf-metal reports as GPU; no special handling needed here.
+    
+    # Enable mixed precision for faster training on supported hardware
+    if has_gpu:
+        try:
+            policy = mixed_precision.Policy('mixed_float16')
+            mixed_precision.set_global_policy(policy)
+            logger.info(f"Mixed precision enabled: {policy.name}")
+            logger.info(f"Compute dtype: {policy.compute_dtype}, Variable dtype: {policy.variable_dtype}")
+        except Exception as e:
+            logger.warning(f"Mixed precision setup failed (will use float32): {e}")
+    else:
+        logger.info("Mixed precision not enabled (no GPU/Metal detected)")
+    
+    # Enable XLA compilation for better performance (only if GPU present)
+    if has_gpu:
+        try:
+            tf.config.optimizer.set_jit(True)
+            logger.info("XLA JIT compilation enabled")
+        except Exception as e:
+            logger.warning(f"XLA JIT enable failed: {e}")
+    else:
+        logger.info("XLA JIT not enabled (no GPU/Metal detected)")
+    
+    return has_gpu
 
 
 def load_klines(path: str = "data/klines") -> pd.DataFrame:
@@ -191,7 +243,7 @@ class TradingEnv:
         self.hold_bonus = hold_bonus
         self.position_penalty = position_penalty
         self.max_idx = len(windows) - 1
-        self.cumulative_profit = 0.0
+        self.cumulative_profit = 0.0  # True P&L sum
         self.num_trades = 0
         self.num_profitable_trades = 0
         self.reset()
@@ -244,35 +296,30 @@ class TradingEnv:
         price_next = self.close_series[self.idx + 1]
         price_change_pct = (price_next - price_now) / price_now
 
-        # Base reward from position
-        reward = self.position * price_change_pct
-        
-        # Track trade profitability
-        if self.position != 0:
-            trade_pnl = self.position * price_change_pct
-            if prev_position != 0 and self.position != prev_position:
-                # Position closed or flipped
-                self.num_trades += 1
-                if trade_pnl > 0:
-                    self.num_profitable_trades += 1
-        
-        # Apply transaction cost only when position changes
+        # Base P&L component
+        pnl = self.position * price_change_pct
+
+        # Apply transaction cost only when position changes (entry/flip)
         if self.position != prev_position:
-            reward -= self.transaction_cost
+            pnl -= self.transaction_cost
             self.num_trades += 1
-        
+
+        # Track profitability when closing or flipping
+        if prev_position != 0 and self.position != prev_position:
+            if pnl > 0:
+                self.num_profitable_trades += 1
+
         # Reward shaping: incentivize holding flat when no strong signal
+        shaping = 0.0
         if action == 0 and self.position == 0:
-            reward += self.hold_bonus
-        
+            shaping += self.hold_bonus
+
         # Penalize holding positions (opportunity cost)
         if self.position != 0:
-            reward -= self.position_penalty
-        
-        # Add profit momentum bonus
-        self.cumulative_profit += reward
-        if self.cumulative_profit > 0:
-            reward += self.cumulative_profit * 0.001  # Small bonus for being in profit
+            shaping -= self.position_penalty
+
+        reward = pnl + shaping
+        self.cumulative_profit += pnl
         
         if self.reward_clip is not None:
             reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
@@ -325,14 +372,15 @@ class ReplayBuffer:
         weights /= weights.max()
         self.frame += 1
 
+        # Convert to TensorFlow tensors for GPU efficiency
         return (
-            np.stack(states),
-            np.array(actions, dtype=np.int32),
-            np.array(rewards, dtype=np.float32),
-            np.stack(next_states),
-            np.array(dones, dtype=np.float32),
+            tf.convert_to_tensor(np.stack(states), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(actions, dtype=np.int32), dtype=tf.int32),
+            tf.convert_to_tensor(np.array(rewards, dtype=np.float32), dtype=tf.float32),
+            tf.convert_to_tensor(np.stack(next_states), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(dones, dtype=np.float32), dtype=tf.float32),
             idxs,
-            weights.astype(np.float32),
+            tf.convert_to_tensor(weights.astype(np.float32), dtype=tf.float32),
         )
 
     def update_priorities(self, indices: np.ndarray, errors: np.ndarray) -> None:
@@ -370,10 +418,54 @@ def create_q_model(window_size: int, feature_size: int, action_size: int) -> Mod
     advantage_mean = Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(advantage)
     advantage_centered = Lambda(lambda a: a[0] - a[1])([advantage, advantage_mean])
     outputs = Lambda(lambda elems: elems[0] + elems[1])([value, advantage_centered])
+    
+    # Force float32 output for numerical stability with mixed precision
+    outputs = Lambda(lambda x: tf.cast(x, tf.float32))(outputs)
 
     model = Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer=Adam(learning_rate=1e-4, clipnorm=1.0), loss=Huber())
+    model.compile(
+        optimizer=Adam(learning_rate=1e-4, clipnorm=1.0),
+        loss=Huber(),
+        jit_compile=True  # Enable XLA compilation for GPU
+    )
     return model
+
+
+@tf.function(reduce_retracing=True)
+def train_step(model, target_model, s_batch, a_batch, r_batch, ns_batch, d_batch, gamma, weights):
+    """GPU-optimized training step with prioritized experience replay."""
+    with tf.GradientTape() as tape:
+        # Current Q values
+        current_q = model(s_batch, training=True)
+        
+        # Double DQN: use online network to select actions, target network to evaluate
+        next_q_online = model(ns_batch, training=False)
+        next_actions = tf.argmax(next_q_online, axis=1, output_type=tf.int32)
+        
+        next_q_target = target_model(ns_batch, training=False)
+        next_indices = tf.stack([tf.range(tf.shape(next_actions)[0]), next_actions], axis=1)
+        max_next_q = tf.gather_nd(next_q_target, next_indices)
+        
+        # Compute target
+        target = r_batch + gamma * max_next_q * (1.0 - d_batch)
+        target = tf.clip_by_value(target, -5.0, 5.0)
+        
+        # Get Q values for taken actions
+        indices = tf.stack([tf.range(tf.shape(a_batch)[0]), a_batch], axis=1)
+        current_q_taken = tf.gather_nd(current_q, indices)
+        
+        # Compute TD errors for priority updates
+        td_errors = target - current_q_taken
+        
+        # Weighted loss for prioritized experience replay
+        losses = Huber()(target, current_q_taken)
+        weighted_loss = tf.reduce_mean(weights * losses)
+    
+    # Compute and apply gradients
+    gradients = tape.gradient(weighted_loss, model.trainable_variables)
+    model.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    
+    return weighted_loss, td_errors
 
 
 def train_dqn(
@@ -459,27 +551,17 @@ def train_dqn(
                     weights,
                 ) = buffer.sample(batch_size)
 
-                current_q = model.predict(s_batch, verbose=0)
-                target_q = np.array(current_q, copy=True)
-                # Double DQN: action selection from online net, evaluation from target net
-                next_q_online = model.predict(ns_batch, verbose=0)
-                next_actions = np.argmax(next_q_online, axis=1)
-                next_q_target = target_model.predict(ns_batch, verbose=0)
-                max_next_q = next_q_target[np.arange(batch_size), next_actions]
-
-                updates = r_batch + gamma * max_next_q * (1.0 - d_batch)
-                updates = np.clip(updates, -5.0, 5.0)
-                td_errors = updates - current_q[np.arange(batch_size), a_batch]
-
-                target_q[np.arange(batch_size), a_batch] = updates
-                target_q = np.clip(target_q, -10.0, 10.0)
-                train_result = model.train_on_batch(s_batch, target_q, sample_weight=weights)
-                buffer.update_priorities(idxs, td_errors)
-                loss_value = (
-                    float(train_result[0])
-                    if isinstance(train_result, (list, tuple))
-                    else float(train_result)
+                # Use GPU-optimized training step
+                loss_tensor, td_errors_tensor = train_step(
+                    model, target_model,
+                    s_batch, a_batch, r_batch, ns_batch, d_batch,
+                    gamma, weights
                 )
+                loss_value = float(loss_tensor.numpy())
+                td_errors = td_errors_tensor.numpy()
+                
+                # Update priorities in replay buffer
+                buffer.update_priorities(idxs, td_errors)
 
                 if step_count % target_update == 0:
                     target_model.set_weights(model.get_weights())
@@ -538,6 +620,11 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     logger.info("Starting Bitcoin price predictor training script")
+    
+    # Setup GPU/accelerator
+    has_gpu = setup_gpu()
+    logger.info(f"Training will run on: {'GPU' if has_gpu else 'CPU (or Metal on Apple Silicon)'}")
+    
     data_dir = "data/klines"
     if not Path(data_dir).exists():
         raise SystemExit(f"Data directory {data_dir} not found")
