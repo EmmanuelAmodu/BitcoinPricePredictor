@@ -1,8 +1,7 @@
 import glob
 import logging
-from collections import deque
 from pathlib import Path
-from typing import Deque, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -287,25 +286,57 @@ class TradingEnv:
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int = 50000) -> None:
+    def __init__(
+        self,
+        capacity: int = 50000,
+        alpha: float = 0.6,
+        beta_start: float = 0.4,
+        beta_frames: int = 100000,
+    ) -> None:
         self.capacity = capacity
-        self.buffer: Deque = deque(maxlen=capacity)
+        self.alpha = alpha
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.buffer: List = []
+        self.priorities = np.zeros(capacity, dtype=np.float32)
+        self.pos = 0
+        self.frame = 1
 
     def add(self, state, action, reward, next_state, done) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
+        max_prio = self.priorities[: len(self.buffer)].max() if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size: int):
-        idxs = np.random.choice(len(self.buffer), size=batch_size, replace=False)
-        states, actions, rewards, next_states, dones = zip(
-            *[self.buffer[i] for i in idxs]
-        )
+        if not self.buffer:
+            raise ValueError("ReplayBuffer is empty")
+        prios = self.priorities[: len(self.buffer)] ** self.alpha
+        probs = prios / prios.sum()
+        idxs = np.random.choice(len(self.buffer), size=batch_size, p=probs)
+        samples = [self.buffer[i] for i in idxs]
+        states, actions, rewards, next_states, dones = zip(*samples)
+
+        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame / self.beta_frames))
+        weights = (len(self.buffer) * probs[idxs]) ** (-beta)
+        weights /= weights.max()
+        self.frame += 1
+
         return (
             np.stack(states),
             np.array(actions, dtype=np.int32),
             np.array(rewards, dtype=np.float32),
             np.stack(next_states),
             np.array(dones, dtype=np.float32),
+            idxs,
+            weights.astype(np.float32),
         )
+
+    def update_priorities(self, indices: np.ndarray, errors: np.ndarray) -> None:
+        self.priorities[indices] = np.abs(errors) + 1e-6
 
     def __len__(self) -> int:
         return len(self.buffer)
@@ -314,26 +345,26 @@ class ReplayBuffer:
 def create_q_model(window_size: int, feature_size: int, action_size: int) -> Model:
     inputs = Input(shape=(window_size, feature_size))
 
-    conv_branch = Conv1D(64, kernel_size=3, activation="relu")(inputs)
+    conv_branch = Conv1D(96, kernel_size=3, activation="relu")(inputs)
     conv_branch = BatchNormalization()(conv_branch)
     conv_branch = Dropout(0.3)(conv_branch)
     conv_branch = Flatten()(conv_branch)
 
-    lstm_branch = LSTM(64, return_sequences=True)(inputs)
+    lstm_branch = LSTM(96, return_sequences=True)(inputs)
     lstm_branch = BatchNormalization()(lstm_branch)
     lstm_branch = Dropout(0.3)(lstm_branch)
     lstm_branch = Flatten()(lstm_branch)
 
     x = Concatenate()([conv_branch, lstm_branch])
-    x = Dense(128, activation="relu")(x)
+    x = Dense(160, activation="relu")(x)
     x = Dropout(0.3)(x)
-    x = Dense(64, activation="relu")(x)
+    x = Dense(96, activation="relu")(x)
 
     # Dueling heads
-    value = Dense(64, activation="relu")(x)
+    value = Dense(96, activation="relu")(x)
     value = Dense(1, activation=None)(value)
 
-    advantage = Dense(64, activation="relu")(x)
+    advantage = Dense(96, activation="relu")(x)
     advantage = Dense(action_size, activation=None)(advantage)
 
     advantage_mean = Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(advantage)
@@ -359,17 +390,29 @@ def train_dqn(
     target_update: int = 250,
     log_every: int = 500,
     max_steps_per_episode: int = 20000,
+    per_alpha: float = 0.6,
+    per_beta_start: float = 0.4,
+    per_beta_frames: int = 100000,
+    buffer_capacity: int = 50000,
 ) -> Tuple[List[float], List[dict]]:
     logger.info(
-        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay=%.4f, max_steps_per_episode=%d",
+        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay=%.4f, max_steps_per_episode=%d, per_alpha=%.2f, per_beta_start=%.2f, per_beta_frames=%d",
         episodes,
         batch_size,
         warmup,
         target_update,
         epsilon_decay,
         max_steps_per_episode,
+        per_alpha,
+        per_beta_start,
+        per_beta_frames,
     )
-    buffer = ReplayBuffer()
+    buffer = ReplayBuffer(
+        capacity=buffer_capacity,
+        alpha=per_alpha,
+        beta_start=per_beta_start,
+        beta_frames=per_beta_frames,
+    )
     rewards_history: List[float] = []
     metrics_history: List[dict] = []
     step_count = 0
@@ -412,9 +455,12 @@ def train_dqn(
                     r_batch,
                     ns_batch,
                     d_batch,
+                    idxs,
+                    weights,
                 ) = buffer.sample(batch_size)
 
-                target_q = model.predict(s_batch, verbose=0)
+                current_q = model.predict(s_batch, verbose=0)
+                target_q = np.array(current_q, copy=True)
                 # Double DQN: action selection from online net, evaluation from target net
                 next_q_online = model.predict(ns_batch, verbose=0)
                 next_actions = np.argmax(next_q_online, axis=1)
@@ -423,9 +469,12 @@ def train_dqn(
 
                 updates = r_batch + gamma * max_next_q * (1.0 - d_batch)
                 updates = np.clip(updates, -5.0, 5.0)
+                td_errors = updates - current_q[np.arange(batch_size), a_batch]
+
                 target_q[np.arange(batch_size), a_batch] = updates
                 target_q = np.clip(target_q, -10.0, 10.0)
-                train_result = model.train_on_batch(s_batch, target_q)
+                train_result = model.train_on_batch(s_batch, target_q, sample_weight=weights)
+                buffer.update_priorities(idxs, td_errors)
                 loss_value = (
                     float(train_result[0])
                     if isinstance(train_result, (list, tuple))
