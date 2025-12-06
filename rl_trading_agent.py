@@ -140,7 +140,7 @@ def build_windows(
     Build sliding windows for states and aligned close prices for rewards.
     Returns:
         windows: shape (num_steps, window_size, feature_size)
-        close_series: shape (num_steps + 1,) unscaled closes to compute P&L
+        close_series: shape (num_steps + 1,) unscaled closes used to compute pct returns
     """
     if len(features) <= window_size:
         raise ValueError("Not enough rows to build even one window.")
@@ -159,19 +159,21 @@ def build_windows(
 
 
 class TradingEnv:
-    """Minimal trading environment with hold/long/short and P&L rewards."""
+    """Minimal trading environment with hold/long/short and P&L rewards on percent returns."""
 
     def __init__(
         self,
         windows: np.ndarray,
         close_series: np.ndarray,
         transaction_cost: float = 0.0005,
+        reward_clip: float = 0.02,
     ) -> None:
         """
         Args:
             windows: (steps, window_size, feature_size) prebuilt feature windows
             close_series: (steps + 1,) raw closes aligned with windows
             transaction_cost: flat cost applied when switching position
+            reward_clip: clip reward to +/- this value (set None to disable)
         """
         if len(close_series) != len(windows) + 1:
             raise ValueError("close_series must be one element longer than windows")
@@ -181,14 +183,16 @@ class TradingEnv:
         self.base_feature_size = windows.shape[2]
         self.action_size = 3  # 0: hold, 1: long, 2: short
         self.transaction_cost = transaction_cost
+        self.reward_clip = reward_clip
         self.max_idx = len(windows) - 1
         self.reset()
         logger.info(
-            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f",
+            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s",
             len(windows),
             self.window_size,
             self.base_feature_size,
             transaction_cost,
+            reward_clip,
         )
 
     def reset(self, seed: int = None) -> np.ndarray:
@@ -214,11 +218,13 @@ class TradingEnv:
 
         price_now = self.close_series[self.idx]
         price_next = self.close_series[self.idx + 1]
-        price_change = price_next - price_now
+        price_change_pct = (price_next - price_now) / price_now
 
-        reward = self.position * price_change
+        reward = self.position * price_change_pct
         if self.position != prev_position:
             reward -= self.transaction_cost
+        if self.reward_clip is not None:
+            reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
 
         self.idx += 1
         done = self.idx >= self.max_idx
@@ -273,7 +279,7 @@ def create_q_model(window_size: int, feature_size: int, action_size: int) -> Mod
     outputs = Dense(action_size, activation=None)(x)  # Q-values
 
     model = Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer=Adam(learning_rate=1e-3), loss=Huber())
+    model.compile(optimizer=Adam(learning_rate=1e-4, clipnorm=1.0), loss=Huber())
     return model
 
 
@@ -286,27 +292,33 @@ def train_dqn(
     gamma: float = 0.99,
     epsilon: float = 1.0,
     epsilon_min: float = 0.05,
-    epsilon_decay: float = 0.995,
+    epsilon_decay_steps: int = 20000,
     warmup: int = 500,
     target_update: int = 250,
     log_every: int = 500,
+    max_steps_per_episode: int = 20000,
 ) -> List[float]:
     logger.info(
-        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d",
+        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay_steps=%d, max_steps_per_episode=%d",
         episodes,
         batch_size,
         warmup,
         target_update,
+        epsilon_decay_steps,
+        max_steps_per_episode,
     )
     buffer = ReplayBuffer()
     rewards_history: List[float] = []
     step_count = 0
+    epsilon_decay_steps = max(1, int(epsilon_decay_steps))
+    epsilon_step = max(0.0, (epsilon - epsilon_min) / float(epsilon_decay_steps))
 
     for ep in range(episodes):
         state = env.reset()
         done = False
         ep_reward = 0.0
         loss_value = None
+        steps_this_episode = 0
         logger.info("Episode %d/%d started with epsilon=%.3f", ep + 1, episodes, epsilon)
 
         while not done:
@@ -316,11 +328,15 @@ def train_dqn(
                 q_values = model.predict(state[None, ...], verbose=0)[0]
                 action = int(np.argmax(q_values))
 
-            next_state, reward, done = env.step(action)
+            next_state, reward, done_env = env.step(action)
+            step_limit_reached = steps_this_episode + 1 >= max_steps_per_episode
+            done = done_env or step_limit_reached
             buffer.add(state, action, reward, next_state, done)
             state = next_state
             ep_reward += reward
             step_count += 1
+            steps_this_episode += 1
+            epsilon = max(epsilon - epsilon_step, epsilon_min)
 
             if len(buffer) == warmup:
                 logger.info("Replay buffer warmup reached (%d transitions)", len(buffer))
@@ -339,7 +355,9 @@ def train_dqn(
                 max_next_q = np.max(next_q, axis=1)
 
                 updates = r_batch + gamma * max_next_q * (1.0 - d_batch)
+                updates = np.clip(updates, -5.0, 5.0)
                 target_q[np.arange(batch_size), a_batch] = updates
+                target_q = np.clip(target_q, -10.0, 10.0)
                 train_result = model.train_on_batch(s_batch, target_q)
                 loss_value = (
                     float(train_result[0])
@@ -362,14 +380,14 @@ def train_dqn(
                     "n/a" if loss_value is None else f"{loss_value:.6f}",
                 )
 
-        epsilon = max(epsilon * epsilon_decay, epsilon_min)
         rewards_history.append(ep_reward)
         logger.info(
-            "Episode %d finished: reward=%.4f | epsilon=%.3f | total_steps=%d",
+            "Episode %d finished: reward=%.4f | epsilon=%.3f | total_steps=%d | steps_this_episode=%d",
             ep + 1,
             ep_reward,
             epsilon,
             step_count,
+            steps_this_episode,
         )
 
     return rewards_history
