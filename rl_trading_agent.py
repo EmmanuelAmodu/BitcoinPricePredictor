@@ -11,7 +11,8 @@ import tensorflow as tf
 from scipy.stats.mstats import winsorize
 from tensorflow.keras import Model
 from tensorflow.keras.layers import (BatchNormalization, Concatenate, Conv1D,
-                                     Dense, Dropout, Flatten, Input, LSTM)
+                                     Dense, Dropout, Flatten, Input, LSTM,
+                                     Lambda)
 from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
 
@@ -327,7 +328,17 @@ def create_q_model(window_size: int, feature_size: int, action_size: int) -> Mod
     x = Dense(128, activation="relu")(x)
     x = Dropout(0.3)(x)
     x = Dense(64, activation="relu")(x)
-    outputs = Dense(action_size, activation=None)(x)  # Q-values
+
+    # Dueling heads
+    value = Dense(64, activation="relu")(x)
+    value = Dense(1, activation=None)(value)
+
+    advantage = Dense(64, activation="relu")(x)
+    advantage = Dense(action_size, activation=None)(advantage)
+
+    advantage_mean = Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(advantage)
+    advantage_centered = Lambda(lambda a: a[0] - a[1])([advantage, advantage_mean])
+    outputs = Lambda(lambda elems: elems[0] + elems[1])([value, advantage_centered])
 
     model = Model(inputs=inputs, outputs=outputs)
     model.compile(optimizer=Adam(learning_rate=1e-4, clipnorm=1.0), loss=Huber())
@@ -404,8 +415,11 @@ def train_dqn(
                 ) = buffer.sample(batch_size)
 
                 target_q = model.predict(s_batch, verbose=0)
-                next_q = target_model.predict(ns_batch, verbose=0)
-                max_next_q = np.max(next_q, axis=1)
+                # Double DQN: action selection from online net, evaluation from target net
+                next_q_online = model.predict(ns_batch, verbose=0)
+                next_actions = np.argmax(next_q_online, axis=1)
+                next_q_target = target_model.predict(ns_batch, verbose=0)
+                max_next_q = next_q_target[np.arange(batch_size), next_actions]
 
                 updates = r_batch + gamma * max_next_q * (1.0 - d_batch)
                 updates = np.clip(updates, -5.0, 5.0)
