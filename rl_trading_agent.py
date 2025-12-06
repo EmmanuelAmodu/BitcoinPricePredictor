@@ -217,11 +217,11 @@ class TradingEnv:
         self,
         windows: np.ndarray,
         close_series: np.ndarray,
-        transaction_cost: float = 0.0002,
+        transaction_cost: float = 0.0001,
         reward_clip: Optional[float] = 0.02,
-        hold_bonus: float = 1e-4,
-        position_penalty: float = 1e-4,
-        trade_penalty: float = 5e-5,
+        hold_bonus: float = 0.0,
+        position_penalty: float = 0.0,
+        trade_penalty: float = 0.0,
     ) -> None:
         """
         Args:
@@ -655,11 +655,11 @@ if __name__ == "__main__":
     env = TradingEnv(
         windows,
         close_series,
-        transaction_cost=0.0002,
+        transaction_cost=0.0001,
         reward_clip=0.02,
-        hold_bonus=1e-4,
-        position_penalty=1e-4,
-        trade_penalty=5e-5,
+        hold_bonus=0.0,
+        position_penalty=0.0,
+        trade_penalty=0.0,
     )
 
     q_model = create_q_model(window_size, feature_size, env.action_size)
