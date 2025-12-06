@@ -1,4 +1,5 @@
 import glob
+import logging
 from collections import deque
 from pathlib import Path
 from typing import Deque, List, Tuple
@@ -15,11 +16,15 @@ from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
 
 
+logger = logging.getLogger(__name__)
+
+
 def load_klines(path: str = "data/klines") -> pd.DataFrame:
     """Load all CSV klines from a folder into a single DataFrame."""
     files = sorted(glob.glob(str(Path(path) / "*.csv")))
     if not files:
         raise FileNotFoundError(f"No CSV files found under {path}")
+    logger.info("Loading %d kline files from %s", len(files), path)
 
     frames: List[pd.DataFrame] = []
     for filename in files:
@@ -51,6 +56,7 @@ def load_klines(path: str = "data/klines") -> pd.DataFrame:
 
     frame["Open time"] = pd.to_datetime(frame["Open time"], unit="ms")
     frame["Close time"] = pd.to_datetime(frame["Close time"], unit="ms")
+    logger.info("Loaded %d rows of klines", len(frame))
     return frame
 
 
@@ -68,6 +74,7 @@ def min_max_scale(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
 
 def engineer_features(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Feature engineering and scaling; returns features and raw closes."""
+    logger.info("Engineering features for %d rows", len(frame))
     # Add time-based features
     time_features = ["Open time", "Close time"]
     for feature in time_features:
@@ -118,6 +125,11 @@ def engineer_features(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         "Close time month",
     ]
     features = frame[feature_cols].to_numpy(dtype=np.float32)
+    logger.info(
+        "Feature matrix built with shape %s and close series length %d",
+        features.shape,
+        raw_closes.shape[0],
+    )
     return features, raw_closes.astype(np.float32)
 
 
@@ -137,6 +149,12 @@ def build_windows(
         windows.append(features[start : start + window_size])
 
     close_series = closes[window_size - 1 :]
+    logger.info(
+        "Built %d windows with window_size=%d and feature_size=%d",
+        len(windows),
+        window_size,
+        features.shape[1],
+    )
     return np.array(windows, dtype=np.float32), np.array(close_series, dtype=np.float32)
 
 
@@ -165,6 +183,13 @@ class TradingEnv:
         self.transaction_cost = transaction_cost
         self.max_idx = len(windows) - 1
         self.reset()
+        logger.info(
+            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f",
+            len(windows),
+            self.window_size,
+            self.base_feature_size,
+            transaction_cost,
+        )
 
     def reset(self, seed: int = None) -> np.ndarray:
         if seed is not None:
@@ -264,7 +289,15 @@ def train_dqn(
     epsilon_decay: float = 0.995,
     warmup: int = 500,
     target_update: int = 250,
+    log_every: int = 500,
 ) -> List[float]:
+    logger.info(
+        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d",
+        episodes,
+        batch_size,
+        warmup,
+        target_update,
+    )
     buffer = ReplayBuffer()
     rewards_history: List[float] = []
     step_count = 0
@@ -273,6 +306,8 @@ def train_dqn(
         state = env.reset()
         done = False
         ep_reward = 0.0
+        loss_value = None
+        logger.info("Episode %d/%d started with epsilon=%.3f", ep + 1, episodes, epsilon)
 
         while not done:
             if np.random.rand() < epsilon:
@@ -286,6 +321,9 @@ def train_dqn(
             state = next_state
             ep_reward += reward
             step_count += 1
+
+            if len(buffer) == warmup:
+                logger.info("Replay buffer warmup reached (%d transitions)", len(buffer))
 
             if len(buffer) >= warmup:
                 (
@@ -302,14 +340,37 @@ def train_dqn(
 
                 updates = r_batch + gamma * max_next_q * (1.0 - d_batch)
                 target_q[np.arange(batch_size), a_batch] = updates
-                model.train_on_batch(s_batch, target_q)
+                train_result = model.train_on_batch(s_batch, target_q)
+                loss_value = (
+                    float(train_result[0])
+                    if isinstance(train_result, (list, tuple))
+                    else float(train_result)
+                )
 
                 if step_count % target_update == 0:
                     target_model.set_weights(model.get_weights())
+                    logger.info("Target network updated at step %d", step_count)
+
+            if log_every and step_count % log_every == 0:
+                logger.info(
+                    "Step %d | ep=%d | epsilon=%.3f | ep_reward=%.5f | buffer=%d | loss=%s",
+                    step_count,
+                    ep + 1,
+                    epsilon,
+                    ep_reward,
+                    len(buffer),
+                    "n/a" if loss_value is None else f"{loss_value:.6f}",
+                )
 
         epsilon = max(epsilon * epsilon_decay, epsilon_min)
         rewards_history.append(ep_reward)
-        print(f"Episode {ep + 1}: reward={ep_reward:.4f}, epsilon={epsilon:.3f}")
+        logger.info(
+            "Episode %d finished: reward=%.4f | epsilon=%.3f | total_steps=%d",
+            ep + 1,
+            ep_reward,
+            epsilon,
+            step_count,
+        )
 
     return rewards_history
 
@@ -326,6 +387,11 @@ def plot_rewards(rewards: List[float]) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logger.info("Starting Bitcoin price predictor training script")
     data_dir = "data/klines"
     if not Path(data_dir).exists():
         raise SystemExit(f"Data directory {data_dir} not found")
@@ -343,6 +409,12 @@ if __name__ == "__main__":
     q_model = create_q_model(window_size, feature_size, env.action_size)
     target_q_model = create_q_model(window_size, feature_size, env.action_size)
     target_q_model.set_weights(q_model.get_weights())
+    logger.info(
+        "Models initialized; window_size=%d feature_size=%d action_size=%d",
+        window_size,
+        feature_size,
+        env.action_size,
+    )
 
     rewards = train_dqn(
         env,
@@ -351,5 +423,6 @@ if __name__ == "__main__":
         episodes=3,
         batch_size=32,
         warmup=200,
+        log_every=500,
     )
     plot_rewards(rewards)
