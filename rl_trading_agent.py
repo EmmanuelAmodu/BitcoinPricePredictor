@@ -151,6 +151,14 @@ def engineer_features(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     # Preserve raw closes for reward calculation
     raw_closes = frame["Close"].to_numpy(copy=True)
 
+    # Momentum/volatility features on raw closes
+    frame["ret_1"] = frame["Close"].pct_change(1).fillna(0.0).clip(-0.1, 0.1)
+    frame["ret_5"] = frame["Close"].pct_change(5).fillna(0.0).clip(-0.2, 0.2)
+    frame["ret_20"] = frame["Close"].pct_change(20).fillna(0.0).clip(-0.3, 0.3)
+    frame["vol_20"] = (
+        frame["Close"].pct_change(1).rolling(20).std().fillna(0.0).clip(0.0, 0.5)
+    )
+
     # Scale and winsorize to keep extreme outliers in check
     frame = min_max_scale(frame, numeric_cols)
     frame[["Open", "High", "Low", "Close", "Volume"]] = frame[
@@ -175,6 +183,10 @@ def engineer_features(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         "Close time day of week",
         "Close time week of year",
         "Close time month",
+        "ret_1",
+        "ret_5",
+        "ret_20",
+        "vol_20",
     ]
     features = frame[feature_cols].to_numpy(dtype=np.float32)
     logger.info(
@@ -501,9 +513,10 @@ def train_dqn(
     per_beta_start: float = 0.4,
     per_beta_frames: int = 100000,
     buffer_capacity: int = 50000,
+    q_margin: float = 0.0,
 ) -> Tuple[List[float], List[dict]]:
     logger.info(
-        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay=%.4f, max_steps_per_episode=%d, per_alpha=%.2f, per_beta_start=%.2f, per_beta_frames=%d",
+        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay=%.4f, max_steps_per_episode=%d, per_alpha=%.2f, per_beta_start=%.2f, per_beta_frames=%d, q_margin=%.3f",
         episodes,
         batch_size,
         warmup,
@@ -513,6 +526,7 @@ def train_dqn(
         per_alpha,
         per_beta_start,
         per_beta_frames,
+        q_margin,
     )
     buffer = ReplayBuffer(
         capacity=buffer_capacity,
@@ -538,7 +552,17 @@ def train_dqn(
                 action = np.random.randint(env.action_size)
             else:
                 q_values = model.predict(state[None, ...], verbose=0)[0]
-                action = int(np.argmax(q_values))
+                best_idx = int(np.argmax(q_values))
+                if q_margin > 0 and env.action_size > 1:
+                    sorted_q = np.sort(q_values)
+                    best_q = sorted_q[-1]
+                    second_q = sorted_q[-2] if len(sorted_q) > 1 else best_q
+                    if best_q - second_q < q_margin:
+                        action = 0  # hold if no clear advantage
+                    else:
+                        action = best_idx
+                else:
+                    action = best_idx
             
             action_counts[action] += 1
 
@@ -647,6 +671,13 @@ if __name__ == "__main__":
     frame = load_klines(data_dir)
     features, closes = engineer_features(frame)
 
+    # Use most recent slice for quicker adaptation
+    recent_rows = 200_000
+    if len(features) > recent_rows:
+        features = features[-recent_rows:]
+        closes = closes[-recent_rows:]
+        logger.info("Sliced to most recent %d rows for training curriculum", recent_rows)
+
     window_size = 64
     windows, close_series = build_windows(features, closes, window_size)
 
@@ -683,6 +714,7 @@ if __name__ == "__main__":
         epsilon_min=0.1,
         log_every=500,
         max_steps_per_episode=12000,  # Shorter episodes initially
+        q_margin=0.02,
     )
     plot_rewards(rewards)
     
