@@ -218,9 +218,10 @@ class TradingEnv:
         windows: np.ndarray,
         close_series: np.ndarray,
         transaction_cost: float = 0.0002,
-        reward_clip: Optional[float] = None,
+        reward_clip: Optional[float] = 0.02,
         hold_bonus: float = 1e-4,
-        position_penalty: float = 5e-5,
+        position_penalty: float = 1e-4,
+        trade_penalty: float = 5e-5,
     ) -> None:
         """
         Args:
@@ -230,6 +231,7 @@ class TradingEnv:
             reward_clip: clip reward to +/- this value (set None to disable)
             hold_bonus: small bonus when staying flat
             position_penalty: small per-step penalty when holding a position
+            trade_penalty: penalty applied per new trade to discourage churn
         """
         if len(close_series) != len(windows) + 1:
             raise ValueError("close_series must be one element longer than windows")
@@ -242,13 +244,14 @@ class TradingEnv:
         self.reward_clip = reward_clip
         self.hold_bonus = hold_bonus
         self.position_penalty = position_penalty
+        self.trade_penalty = trade_penalty
         self.max_idx = len(windows) - 1
         self.cumulative_profit = 0.0  # True P&L sum
         self.num_trades = 0
         self.num_profitable_trades = 0
         self.reset()
         logger.info(
-            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s, hold_bonus=%s, position_penalty=%s",
+            "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s, hold_bonus=%s, position_penalty=%s, trade_penalty=%s",
             len(windows),
             self.window_size,
             self.base_feature_size,
@@ -256,16 +259,27 @@ class TradingEnv:
             reward_clip,
             hold_bonus,
             position_penalty,
+            trade_penalty,
         )
     
     def get_metrics(self) -> dict:
         """Return current episode metrics."""
         win_rate = self.num_profitable_trades / max(1, self.num_trades)
+        flat_profit = 0.0  # Always flat baseline
+        # Simple buy-and-hold baseline over current episode window
+        if self.idx + 1 < len(self.close_series):
+            start_price = float(self.close_series[max(0, self.idx - self.window_size + 1)])
+            current_price = float(self.close_series[self.idx])
+            buy_hold = (current_price - start_price) / start_price if start_price != 0 else 0.0
+        else:
+            buy_hold = 0.0
         return {
             "cumulative_profit": self.cumulative_profit,
             "num_trades": self.num_trades,
             "num_profitable_trades": self.num_profitable_trades,
             "win_rate": win_rate,
+            "flat_profit": flat_profit,
+            "buy_hold_profit": buy_hold,
         }
 
     def reset(self, seed: int = None) -> np.ndarray:
@@ -303,6 +317,7 @@ class TradingEnv:
         if self.position != prev_position:
             pnl -= self.transaction_cost
             self.num_trades += 1
+            pnl -= self.trade_penalty
 
         # Track profitability when closing or flipping
         if prev_position != 0 and self.position != prev_position:
@@ -477,11 +492,11 @@ def train_dqn(
     gamma: float = 0.99,
     epsilon: float = 1.0,
     epsilon_min: float = 0.1,
-    epsilon_decay: float = 0.9995,  # Exponential decay rate
+    epsilon_decay: float = 0.9998,  # Slower exponential decay
     warmup: int = 2000,
     target_update: int = 250,
     log_every: int = 500,
-    max_steps_per_episode: int = 20000,
+    max_steps_per_episode: int = 12000,
     per_alpha: float = 0.6,
     per_beta_start: float = 0.4,
     per_beta_frames: int = 100000,
@@ -641,9 +656,10 @@ if __name__ == "__main__":
         windows,
         close_series,
         transaction_cost=0.0002,
-        reward_clip=None,
+        reward_clip=0.02,
         hold_bonus=1e-4,
-        position_penalty=5e-5,
+        position_penalty=1e-4,
+        trade_penalty=5e-5,
     )
 
     q_model = create_q_model(window_size, feature_size, env.action_size)
@@ -663,9 +679,10 @@ if __name__ == "__main__":
         episodes=3,
         batch_size=64,
         warmup=2000,
-        epsilon_decay=0.9997,  # Slower decay for better exploration
+        epsilon_decay=0.9998,  # Slower decay for better exploration
+        epsilon_min=0.1,
         log_every=500,
-        max_steps_per_episode=15000,  # Shorter episodes initially
+        max_steps_per_episode=12000,  # Shorter episodes initially
     )
     plot_rewards(rewards)
     
