@@ -191,6 +191,9 @@ class TradingEnv:
         self.hold_bonus = hold_bonus
         self.position_penalty = position_penalty
         self.max_idx = len(windows) - 1
+        self.cumulative_profit = 0.0
+        self.num_trades = 0
+        self.num_profitable_trades = 0
         self.reset()
         logger.info(
             "TradingEnv initialized: steps=%d, window_size=%d, feature_size=%d, transaction_cost=%.4f, reward_clip=%s, hold_bonus=%s, position_penalty=%s",
@@ -202,12 +205,25 @@ class TradingEnv:
             hold_bonus,
             position_penalty,
         )
+    
+    def get_metrics(self) -> dict:
+        """Return current episode metrics."""
+        win_rate = self.num_profitable_trades / max(1, self.num_trades)
+        return {
+            "cumulative_profit": self.cumulative_profit,
+            "num_trades": self.num_trades,
+            "num_profitable_trades": self.num_profitable_trades,
+            "win_rate": win_rate,
+        }
 
     def reset(self, seed: int = None) -> np.ndarray:
         if seed is not None:
             np.random.seed(seed)
         self.idx = 0
         self.position = 0  # -1 short, 0 flat, 1 long
+        self.cumulative_profit = 0.0
+        self.num_trades = 0
+        self.num_profitable_trades = 0
         return self._augment_state(self.windows[self.idx])
 
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
@@ -228,13 +244,36 @@ class TradingEnv:
         price_next = self.close_series[self.idx + 1]
         price_change_pct = (price_next - price_now) / price_now
 
+        # Base reward from position
         reward = self.position * price_change_pct
-        if action == 0 and self.position == 0:
-            reward += self.hold_bonus
+        
+        # Track trade profitability
         if self.position != 0:
-            reward -= self.position_penalty
+            trade_pnl = self.position * price_change_pct
+            if prev_position != 0 and self.position != prev_position:
+                # Position closed or flipped
+                self.num_trades += 1
+                if trade_pnl > 0:
+                    self.num_profitable_trades += 1
+        
+        # Apply transaction cost only when position changes
         if self.position != prev_position:
             reward -= self.transaction_cost
+            self.num_trades += 1
+        
+        # Reward shaping: incentivize holding flat when no strong signal
+        if action == 0 and self.position == 0:
+            reward += self.hold_bonus
+        
+        # Penalize holding positions (opportunity cost)
+        if self.position != 0:
+            reward -= self.position_penalty
+        
+        # Add profit momentum bonus
+        self.cumulative_profit += reward
+        if self.cumulative_profit > 0:
+            reward += self.cumulative_profit * 0.001  # Small bonus for being in profit
+        
         if self.reward_clip is not None:
             reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
 
@@ -304,26 +343,25 @@ def train_dqn(
     gamma: float = 0.99,
     epsilon: float = 1.0,
     epsilon_min: float = 0.1,
-    epsilon_decay_steps: int = 10000,
+    epsilon_decay: float = 0.9995,  # Exponential decay rate
     warmup: int = 2000,
     target_update: int = 250,
     log_every: int = 500,
     max_steps_per_episode: int = 20000,
-) -> List[float]:
+) -> Tuple[List[float], List[dict]]:
     logger.info(
-        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay_steps=%d, max_steps_per_episode=%d",
+        "Starting DQN training: episodes=%d, batch_size=%d, warmup=%d, target_update=%d, epsilon_decay=%.4f, max_steps_per_episode=%d",
         episodes,
         batch_size,
         warmup,
         target_update,
-        epsilon_decay_steps,
+        epsilon_decay,
         max_steps_per_episode,
     )
     buffer = ReplayBuffer()
     rewards_history: List[float] = []
+    metrics_history: List[dict] = []
     step_count = 0
-    epsilon_decay_steps = max(1, int(epsilon_decay_steps))
-    epsilon_step = max(0.0, (epsilon - epsilon_min) / float(epsilon_decay_steps))
 
     for ep in range(episodes):
         state = env.reset()
@@ -331,6 +369,7 @@ def train_dqn(
         ep_reward = 0.0
         loss_value = None
         steps_this_episode = 0
+        action_counts = {0: 0, 1: 0, 2: 0}  # Track action distribution
         logger.info("Episode %d/%d started with epsilon=%.3f", ep + 1, episodes, epsilon)
 
         while not done:
@@ -339,6 +378,8 @@ def train_dqn(
             else:
                 q_values = model.predict(state[None, ...], verbose=0)[0]
                 action = int(np.argmax(q_values))
+            
+            action_counts[action] += 1
 
             next_state, reward, done_env = env.step(action)
             step_limit_reached = steps_this_episode + 1 >= max_steps_per_episode
@@ -348,7 +389,7 @@ def train_dqn(
             ep_reward += reward
             step_count += 1
             steps_this_episode += 1
-            epsilon = max(epsilon - epsilon_step, epsilon_min)
+            epsilon = max(epsilon * epsilon_decay, epsilon_min)  # Exponential decay
 
             if len(buffer) == warmup:
                 logger.info("Replay buffer warmup reached (%d transitions)", len(buffer))
@@ -382,27 +423,39 @@ def train_dqn(
                     logger.info("Target network updated at step %d", step_count)
 
             if log_every and step_count % log_every == 0:
+                env_metrics = env.get_metrics()
                 logger.info(
-                    "Step %d | ep=%d | epsilon=%.3f | ep_reward=%.5f | buffer=%d | loss=%s",
+                    "Step %d | ep=%d | ε=%.3f | reward=%.5f | profit=%.5f | trades=%d | win_rate=%.2f%% | buffer=%d | loss=%s",
                     step_count,
                     ep + 1,
                     epsilon,
                     ep_reward,
+                    env_metrics["cumulative_profit"],
+                    env_metrics["num_trades"],
+                    env_metrics["win_rate"] * 100,
                     len(buffer),
                     "n/a" if loss_value is None else f"{loss_value:.6f}",
                 )
 
         rewards_history.append(ep_reward)
+        env_metrics = env.get_metrics()
+        metrics_history.append(env_metrics)
+        
+        action_dist = {k: v / max(1, steps_this_episode) * 100 for k, v in action_counts.items()}
         logger.info(
-            "Episode %d finished: reward=%.4f | epsilon=%.3f | total_steps=%d | steps_this_episode=%d",
+            "Episode %d finished: reward=%.4f | profit=%.4f | trades=%d | win_rate=%.2f%% | ε=%.3f | actions: hold=%.1f%% long=%.1f%% short=%.1f%%",
             ep + 1,
             ep_reward,
+            env_metrics["cumulative_profit"],
+            env_metrics["num_trades"],
+            env_metrics["win_rate"] * 100,
             epsilon,
-            step_count,
-            steps_this_episode,
+            action_dist[0],
+            action_dist[1],
+            action_dist[2],
         )
 
-    return rewards_history
+    return rewards_history, metrics_history
 
 
 def plot_rewards(rewards: List[float]) -> None:
@@ -453,13 +506,26 @@ if __name__ == "__main__":
         env.action_size,
     )
 
-    rewards = train_dqn(
+    rewards, metrics = train_dqn(
         env,
         q_model,
         target_q_model,
         episodes=3,
         batch_size=64,
         warmup=2000,
+        epsilon_decay=0.9997,  # Slower decay for better exploration
         log_every=500,
+        max_steps_per_episode=15000,  # Shorter episodes initially
     )
     plot_rewards(rewards)
+    
+    # Print final metrics
+    logger.info("Training completed. Final episode metrics:")
+    final_metrics = metrics[-1]
+    logger.info(
+        "  Cumulative profit: %.4f | Total trades: %d | Profitable trades: %d | Win rate: %.2f%%",
+        final_metrics["cumulative_profit"],
+        final_metrics["num_trades"],
+        final_metrics["num_profitable_trades"],
+        final_metrics["win_rate"] * 100,
+    )
