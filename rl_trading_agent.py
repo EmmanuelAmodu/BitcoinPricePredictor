@@ -259,6 +259,7 @@ class TradingEnv:
         self.trade_penalty = trade_penalty
         self.max_idx = len(windows) - 1
         self.cumulative_profit = 0.0  # True P&L sum
+        self.entry_price: Optional[float] = None  # Track entry for ROI gating
         self.num_trades = 0
         self.num_profitable_trades = 0
         self.reset()
@@ -300,6 +301,7 @@ class TradingEnv:
         self.idx = 0
         self.position = 0  # -1 short, 0 flat, 1 long
         self.cumulative_profit = 0.0
+        self.entry_price = None
         self.num_trades = 0
         self.num_profitable_trades = 0
         return self._augment_state(self.windows[self.idx])
@@ -313,12 +315,30 @@ class TradingEnv:
             raise ValueError("action must be 0 (hold), 1 (long), or 2 (short)")
 
         prev_position = self.position
+        desired_position = prev_position
         if action == 1:
-            self.position = 1
+            desired_position = 1
         elif action == 2:
-            self.position = -1
+            desired_position = -1
 
         price_now = self.close_series[self.idx]
+        roi_since_entry = 0.0
+        blocked_for_loss = False
+
+        # Block exits/flips if the running ROI on the open position is negative
+        if prev_position != 0 and desired_position != prev_position:
+            entry_price = self.entry_price if self.entry_price not in (None, 0) else price_now
+            roi_since_entry = (
+                prev_position * (price_now - entry_price) / entry_price if entry_price else 0.0
+            )
+            if roi_since_entry < 0:
+                desired_position = prev_position
+                blocked_for_loss = True
+
+        self.position = desired_position
+
+        # When we override the action to hold, treat shaping like a hold step
+        effective_action = 0 if blocked_for_loss else action
         price_next = self.close_series[self.idx + 1]
         price_change_pct = (price_next - price_now) / price_now
 
@@ -333,12 +353,12 @@ class TradingEnv:
 
         # Track profitability when closing or flipping
         if prev_position != 0 and self.position != prev_position:
-            if pnl > 0:
+            if roi_since_entry > 0:
                 self.num_profitable_trades += 1
 
         # Reward shaping: incentivize holding flat when no strong signal
         shaping = 0.0
-        if action == 0 and self.position == 0:
+        if effective_action == 0 and self.position == 0:
             shaping += self.hold_bonus
 
         # Penalize holding positions (opportunity cost)
@@ -352,6 +372,12 @@ class TradingEnv:
             reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
 
         self.idx += 1
+        if self.position != prev_position:
+            if self.position == 0:
+                self.entry_price = None
+            else:
+                self.entry_price = price_now
+
         done = self.idx >= self.max_idx
         next_state = (
             self._augment_state(self.windows[self.idx]) if not done else self._augment_state(self.windows[self.max_idx])
